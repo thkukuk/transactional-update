@@ -15,8 +15,8 @@
 #include <filesystem>
 #include <regex>
 #include <selinux/selinux.h>
-#include <selinux/context.h>
 #include <sstream>
+#include <fstream>
 #include <unistd.h>
 
 using std::exception;
@@ -114,21 +114,21 @@ void Overlay::sync(string base, fs::path snapRoot) {
     previousEtc->removeOption("upperdir");
     previousEtc->removeOption("workdir");
 
+    tulog.debug("previousOvl", previousOvl);
+
     string syncSource = string(previousOvl.upperdir.parent_path() / "sync" / "etc") + "/";
     string rsyncExtraArgs;
     previousEtc->mount(previousOvl.upperdir.parent_path() / "sync");
     tulog.info("Syncing /etc of previous snapshot ", previousSnapId, " as base into new snapshot ", snapRoot);
     if (is_selinux_enabled()) {
+        // IF SELinux is enabled we need to ignore the SELinux attributes when
+        // synchronizing pre-SELinux files, rsync would fail otherwise.
+	// Also, if the previous snapshot as the .autorelabel marker in place,
+	// it means it was never booted with SElinux enabled, so might contain
+	// unlabelled files
         tulog.info("SELinux is enabled.");
-        // Ignore the SELinux attributes when synchronizing pre-SELinux files,
-        // rsync will fail otherwise
-        char* context;
-        if (getfilecon(syncSource.c_str(), &context) > 0) { // &&
-            auto contextt = context_new(context);
-            if (strcmp(context_type_get(contextt), "unlabeled_t") == 0) {
-                rsyncExtraArgs = "--filter='-x security.selinux'";
-            }
-        }
+        if (Util::se_is_context_type(syncSource, "unlabeled_t") || fs::exists(syncSource + "/selinux/.autorelabel"))
+            rsyncExtraArgs = "--filter='-x security.selinux'";
     }
     Util::exec("rsync --quiet --archive --inplace --xattrs --exclude='/fstab' " + rsyncExtraArgs + " --acls --delete " + syncSource + " " + string(snapRoot) + "/etc");
 }
@@ -189,6 +189,8 @@ void Overlay::create(string base, string snapshot, fs::path snapRoot) {
     fs::remove_all(upperdir);
     fs::create_directories(upperdir);
 
+    Util::se_copycontext("/etc", upperdir);
+
     // Assemble the new lowerdirs
     lowerdirs.clear();
     lowerdirs.push_back(parent.upperdir);
@@ -208,6 +210,14 @@ void Overlay::create(string base, string snapshot, fs::path snapRoot) {
         lowerdirs.push_back(parent.lowerdirs.back());
         sync(base, snapRoot);
     }
+}
+
+std::ostream & operator<<( std::ostream & str, const Overlay & obj )
+{
+    for (auto d: obj.lowerdirs) {
+        str << "lowerdir=" << d << ", ";
+    }
+    return str << "upperdir=" << obj.upperdir << ", workdir=" << obj.workdir;
 }
 
 } // namespace TransactionalUpdate
